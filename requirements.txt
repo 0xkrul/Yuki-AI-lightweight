@@ -1,0 +1,8 @@
+discord.py==2.4.0
+asyncpg
+aiohttp
+jishaku
+humanfriendly
+python-dotenv
+transformers
+torch
