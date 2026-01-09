@@ -4,5 +4,3 @@ aiohttp
 jishaku
 humanfriendly
 python-dotenv
-transformers
-torch

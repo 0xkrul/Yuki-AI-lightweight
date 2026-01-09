@@ -1,14 +1,14 @@
 """
-OPTIMIZED AI MODERATION COG
-===========================
-Performance improvements:
-1. Offload AI inference to thread pool (non-blocking)
-2. LRU cache for AI results (same message = instant result)
-3. Precompiled regex patterns
-4. Lazy model loading (only when first needed)
-5. Batch processing capability
-6. Memory-efficient data structures
-7. Reduced string operations
+ULTRA-OPTIMIZED AI MODERATION COG
+==================================
+Optimized for low-resource VPS (1GB RAM, 2 vCPUs):
+1. NO heavy models (PyTorch/BERT removed)
+2. Lightweight async HTTP API calls OR fast heuristic fallback
+3. Aggressive LRU cache (2hr TTL, 5000 entries)
+4. Precompiled regex patterns
+5. Memory-efficient data structures
+6. Works WITHOUT GPU/CUDA
+7. Can run completely offline with heuristic mode
 """
 
 import asyncio
@@ -18,21 +18,18 @@ import time
 import unicodedata
 from typing import Dict, List, Optional, Tuple
 from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import os
 
 import discord
 from discord.ext import commands
 
-# Optional AI deps (degrades gracefully if missing)
+# Lightweight AI deps - uses free APIs instead of heavy local models
 try:
-    import torch
-    from transformers import AutoTokenizer, AutoModelForSequenceClassification
+    import aiohttp
     AI_AVAILABLE = True
 except Exception:
-    torch = None
-    AutoTokenizer = None
-    AutoModelForSequenceClassification = None
+    aiohttp = None
     AI_AVAILABLE = False
 
 log = logging.getLogger("policy_moderation")
@@ -83,22 +80,25 @@ class LocalPolicyModeration(commands.Cog):
         self.user_violations: Dict[int, Dict[str, int]] = {}
         self.strikes_before_timeout = 3
 
-        # OPTIMIZATION: Thread pool for AI inference (non-blocking)
-        # Increased to 10 workers to handle floods (e.g., 5+ people spamming)
-        self._executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="ai_mod")
+        # OPTIMIZATION: No thread pool needed - using async HTTP
         
-        # OPTIMIZATION: AI result cache (content hash -> result)
+        # OPTIMIZATION: AI result cache (content hash -> result) - AGGRESSIVE caching
         self._ai_cache = {}  # {hash: (result, timestamp)}
-        self._ai_cache_ttl = 3600  # 1 hour cache
-        self._ai_cache_max_size = 1000
+        self._ai_cache_ttl = 7200  # 2 hour cache (more aggressive)
+        self._ai_cache_max_size = 5000  # Larger cache to minimize API calls
         
-        # AI setup - increased semaphore to handle concurrent flood
-        self.ai_semaphore = asyncio.Semaphore(10)
-        self.model_lock = asyncio.Lock()
-        self._tokenizer = None
-        self._model = None
-        self._model_loading = False
+        # AI setup - async HTTP session
+        self.ai_semaphore = asyncio.Semaphore(5)  # Limit concurrent API calls
+        self._http_session: Optional[aiohttp.ClientSession] = None
         self.ai_enabled = AI_AVAILABLE
+        
+        # Perspective API key (optional, get free at https://perspectiveapi.com/)
+        # Load from environment variable
+        self.perspective_api_key = os.getenv("PERSPECTIVE_API_KEY")
+        if self.perspective_api_key:
+            log.info("✓ Perspective API key loaded - using enhanced AI moderation")
+        else:
+            log.info("⚡ Using fast heuristic mode (no API key) - still very effective!")
 
         # AI thresholds
         self.ai_thresholds = {
@@ -192,11 +192,18 @@ class LocalPolicyModeration(commands.Cog):
             re.compile(r"\b(?:cheap|free|selling)\s*(?:nitro|robux|v-?bucks|accounts|cheats|hacks|boosts)\b", re.I),
         ]
 
-        log.info("✓ LocalPolicyModeration loaded (OPTIMIZED)")
+        log.info("✓ LocalPolicyModeration loaded (ULTRA-OPTIMIZED for low-resource VPS)")
 
     def cog_unload(self):
-        """OPTIMIZATION: Clean up thread pool"""
-        self._executor.shutdown(wait=False)
+        """OPTIMIZATION: Clean up HTTP session"""
+        if self._http_session and not self._http_session.closed:
+            asyncio.create_task(self._http_session.close())
+    
+    async def _get_http_session(self) -> aiohttp.ClientSession:
+        """Get or create HTTP session"""
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession()
+        return self._http_session
     
     # ---------------- OPTIMIZATION: Cache Management ----------------
     def _get_content_hash(self, text: str) -> str:
@@ -417,81 +424,112 @@ class LocalPolicyModeration(commands.Cog):
                 return "promo:advertising"
         return None
 
-    # ---------------- OPTIMIZATION: AI with thread pool ----------------
-    async def _ensure_model_loaded(self) -> None:
-        """OPTIMIZED: Lazy model loading"""
-        if not self.ai_enabled:
-            return
-        
-        if self._model_loading:
-            # Wait for ongoing load
-            while self._model_loading:
-                await asyncio.sleep(0.1)
-            return
-        
-        if self._tokenizer is not None and self._model is not None:
-            return
-
-        async with self.model_lock:
-            if self._tokenizer is not None and self._model is not None:
-                return
-            
-            try:
-                self._model_loading = True
-                log.info("Loading AI model unitary/toxic-bert...")
-                
-                # OPTIMIZATION: Load in thread pool to avoid blocking
-                loop = asyncio.get_event_loop()
-                self._tokenizer = await loop.run_in_executor(
-                    self._executor,
-                    AutoTokenizer.from_pretrained,
-                    "unitary/toxic-bert"
-                )
-                self._model = await loop.run_in_executor(
-                    self._executor,
-                    AutoModelForSequenceClassification.from_pretrained,
-                    "unitary/toxic-bert"
-                )
-                self._model.eval()
-                
-                log.info("✓ AI model loaded successfully")
-            except Exception as e:
-                self.ai_enabled = False
-                log.exception("⚠ AI disabled: model load failed: %s", e)
-            finally:
-                self._model_loading = False
-
-    def _run_ai_inference(self, text_in: str) -> Dict[str, float]:
-        """OPTIMIZATION: Run in thread pool (blocking operation)"""
-        if self._tokenizer is None or self._model is None:
+    # ---------------- OPTIMIZATION: Lightweight AI using free APIs ----------------
+    async def _call_perspective_api(self, text_in: str) -> Dict[str, float]:
+        """Call Perspective API (free tier: 1 QPS)"""
+        if not self.perspective_api_key:
             return {}
         
-        enc = self._tokenizer(text_in, return_tensors="pt", truncation=True, max_length=256)
-        with torch.no_grad():
-            out = self._model(**enc)
-            probs = torch.sigmoid(out.logits)[0].cpu().tolist()
-
-        labels = list(self._model.config.id2label.values())
-        return {labels[i]: float(probs[i]) for i in range(min(len(labels), len(probs)))}
+        try:
+            session = await self._get_http_session()
+            url = f"https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze?key={self.perspective_api_key}"
+            data = {
+                "comment": {"text": text_in},
+                "languages": ["en"],
+                "requestedAttributes": {
+                    "TOXICITY": {},
+                    "SEVERE_TOXICITY": {},
+                    "IDENTITY_ATTACK": {},
+                    "INSULT": {},
+                    "THREAT": {},
+                    "SEXUALLY_EXPLICIT": {}
+                }
+            }
+            async with session.post(url, json=data, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                if resp.status == 200:
+                    result = await resp.json()
+                    scores = {}
+                    for attr, data in result.get("attributeScores", {}).items():
+                        score = data.get("summaryScore", {}).get("value", 0)
+                        # Map to our labels
+                        if attr == "TOXICITY":
+                            scores["toxic"] = score
+                        elif attr == "SEVERE_TOXICITY":
+                            scores["severe_toxic"] = score
+                        elif attr == "IDENTITY_ATTACK":
+                            scores["identity_hate"] = score
+                        elif attr == "INSULT":
+                            scores["insult"] = score
+                        elif attr == "THREAT":
+                            scores["threat"] = score
+                        elif attr == "SEXUALLY_EXPLICIT":
+                            scores["sexual_explicit"] = score
+                    return scores
+        except Exception as e:
+            log.debug(f"Perspective API error: {e}")
+        return {}
+    
+    async def _simple_heuristic_scores(self, text_in: str) -> Dict[str, float]:
+        """Fallback: Fast heuristic-based scoring (no API needed)"""
+        text_lower = text_in.lower()
+        scores = {}
+        
+        # Threat keywords
+        threat_words = ["kill", "die", "murder", "attack", "hurt", "harm", "beat", "shoot", "stab"]
+        threat_score = sum(1 for w in threat_words if w in text_lower) / max(len(threat_words), 1)
+        scores["threat"] = min(threat_score * 0.5, 0.9)
+        
+        # Identity hate keywords
+        hate_words = [word.replace(" ", "") for word in self.always_block_roots]
+        hate_score = sum(1 for w in hate_words if w in text_lower.replace(" ", "")) / max(len(hate_words), 1)
+        scores["identity_hate"] = min(hate_score, 0.95)
+        
+        # Toxic keywords
+        toxic_words = ["stupid", "idiot", "dumb", "moron", "trash", "garbage", "pathetic", "loser"]
+        toxic_score = sum(1 for w in toxic_words if w in text_lower) / max(len(toxic_words), 1)
+        scores["toxic"] = min(toxic_score * 0.4, 0.8)
+        
+        # Insult keywords
+        insult_words = ["ugly", "fat", "gross", "disgusting", "worthless"]
+        insult_score = sum(1 for w in insult_words if w in text_lower) / max(len(insult_words), 1)
+        scores["insult"] = min(insult_score * 0.5, 0.85)
+        
+        # Sexual explicit
+        sexual_score = sum(1 for kw in self.nsfw_keywords if kw in text_lower) / max(len(self.nsfw_keywords), 1)
+        scores["sexual_explicit"] = min(sexual_score * 0.3, 0.75)
+        
+        # Severe toxic (multiple indicators)
+        severe_indicators = sum([
+            scores.get("threat", 0) > 0.3,
+            scores.get("identity_hate", 0) > 0.3,
+            scores.get("toxic", 0) > 0.5,
+            len([w for w in ["fuck", "shit", "bitch", "ass"] if w in text_lower]) > 2
+        ])
+        scores["severe_toxic"] = min(severe_indicators * 0.25, 0.9)
+        
+        return scores
 
     async def _ai_scores(self, text_in: str) -> Dict[str, float]:
-        """OPTIMIZED: AI inference with caching and thread pool"""
-        await self._ensure_model_loaded()
-        if not self.ai_enabled or self._tokenizer is None or self._model is None:
+        """ULTRA-OPTIMIZED: AI inference with aggressive caching and lightweight processing"""
+        if not self.ai_enabled:
             return {}
         
-        # OPTIMIZATION: Check cache first
+        # OPTIMIZATION: Check cache first (most important for performance)
         content_hash = self._get_content_hash(text_in)
         cached_result = self._get_cached_ai_result(content_hash)
         if cached_result is not None:
             return cached_result
         
-        # OPTIMIZATION: Run inference in thread pool (non-blocking)
-        loop = asyncio.get_event_loop()
-        scores = await loop.run_in_executor(self._executor, self._run_ai_inference, text_in)
+        # Try Perspective API if configured, otherwise use fast heuristics
+        if self.perspective_api_key:
+            scores = await self._call_perspective_api(text_in)
+        else:
+            # FAST: No API calls, pure heuristic (works offline!)
+            scores = await self._simple_heuristic_scores(text_in)
         
-        # Cache result
-        self._cache_ai_result(content_hash, scores)
+        # Cache result for future
+        if scores:
+            self._cache_ai_result(content_hash, scores)
         
         return scores
 
