@@ -664,8 +664,27 @@ class LocalPolicyModeration(commands.Cog):
         except Exception as e:
             log.warning("Log send failed: %s", e)
 
+    async def _bulk_delete_user_messages(self, channel: discord.TextChannel, user_id: int, limit: int = 20) -> int:
+        """Bulk delete recent messages from a user (bleed.bot style)"""
+        try:
+            deleted = 0
+            # Fetch recent messages
+            async for msg in channel.history(limit=100):
+                if msg.author.id == user_id:
+                    try:
+                        await msg.delete()
+                        deleted += 1
+                        if deleted >= limit:
+                            break
+                    except:
+                        pass
+            return deleted
+        except Exception as e:
+            log.warning(f"Bulk delete failed: {e}")
+            return 0
+
     async def _handle_violation(self, message: discord.Message, reason: str) -> None:
-        """OPTIMIZED: Handle violations with strikes"""
+        """OPTIMIZED: Handle violations with strikes and bulk deletion on timeout"""
         # Delete message
         if self.delete_on_violation:
             try:
@@ -680,7 +699,7 @@ class LocalPolicyModeration(commands.Cog):
         # Warn user
         await self._warn_channel_with_strikes(message, category, strike_count)
 
-        # Apply timeout after 3rd strike
+        # Apply timeout after 3rd strike + bulk delete recent messages
         if isinstance(message.author, discord.Member) and strike_count >= self.strikes_before_timeout:
             timeout_mins = 0
             
@@ -696,7 +715,14 @@ class LocalPolicyModeration(commands.Cog):
                 timeout_mins = self.timeout_minutes_for_nsfw
             
             if timeout_mins > 0:
+                # Timeout the user
                 await self._timeout_member(message.author, timeout_mins, f"{reason} (Strike {strike_count})")
+                
+                # Bulk delete their recent messages (bleed.bot style)
+                if isinstance(message.channel, discord.TextChannel):
+                    deleted = await self._bulk_delete_user_messages(message.channel, message.author.id, 20)
+                    if deleted > 0:
+                        log.info(f"Bulk deleted {deleted} messages from {message.author} ({message.author.id})")
 
         await self._log_violation(message, reason, strike_count, category)
 
