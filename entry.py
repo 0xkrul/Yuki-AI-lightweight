@@ -257,8 +257,16 @@ class CommandClient(commands.AutoShardedBot):
             await StartUp.loadcogs(self)
        
         print(f"✓ Connected as {self.user} ({self.user.id})")
-        if self.ping > 0:
+        
+        # Wait a moment for latency to stabilize
+        await asyncio.sleep(2)
+        
+        # Check if latency is valid
+        if self.ping > 0 and self.ping < 5000:
             print(f"✓ Latency: {self.ping}ms")
+        else:
+            print(f"✓ Latency: Measuring...")
+            
         print(f"✓ Guilds: {len(self.guilds)}")
         print(f"✓ AI Moderation Ready")
     
