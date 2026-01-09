@@ -4,16 +4,32 @@ from discord.gateway import DiscordWebSocket
 from tools.utils import StartUp, create_db
 from tools.ext import Client, HTTP
 from humanfriendly import format_timespan
-from typing import List, Optional
+from typing import List, Optional, Set
 from tools.utils import PaginatorView
 from io import BytesIO 
 import dotenv
-from pathlib import
- Path
+from pathlib import Path
 import asyncio
 
 dotenv.load_dotenv(Path(__file__).parent / '.env', verbose=True)
 token = os.environ['token']
+
+# Guild configuration cache
+class GuildConfigCache:
+    """Simple cache for guild configurations"""
+    def __init__(self):
+        self._only_cmd = {}  # {guild_id: set(channel_ids)}
+    
+    def get_only_cmd(self, guild_id: int) -> Optional[Set[int]]:
+        return self._only_cmd.get(guild_id)
+    
+    def set_only_cmd(self, guild_id: int, channel_ids: Set[int]):
+        self._only_cmd[guild_id] = channel_ids
+    
+    def clear_only_cmd(self, guild_id: int):
+        self._only_cmd.pop(guild_id, None)
+
+guild_config_cache = GuildConfigCache()
 
 def generate_key():
     return ''.join(random.choice(string.ascii_letters + string.digits) for _ in range(6))
